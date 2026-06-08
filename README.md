@@ -1,228 +1,164 @@
 # ternary-regression
 
-Linear regression where every feature is {−1, 0, +1}.
+Linear regression where every feature lives in {−1, 0, +1}.
 
-Standard linear regression works fine with ternary features — the math doesn't care about the input range. But when you *know* your features are ternary, interesting things happen: the design matrix has bounded condition number, regularization is less critical, and the normal equation solver doesn't need preconditioning. This crate exploits those properties to give you clean, interpretable regression results with a minimal API.
+## The Problem
 
-It provides three solvers (OLS, Ridge, Lasso), full residual analysis, R² computation, and convenience functions that get you from data to results in one call.
+You have a dataset where features are ternary — quantized neural network weights, balanced ternary encodings, hash codes — and you need to predict a continuous target. You *could* feed these into any regression library, but you'd be paying for generality you don't need: feature scaling is unnecessary, the design matrix is well-conditioned by construction, and the Gramian `XᵀX` has a structure you can reason about.
 
-## Why This Exists
+The real problem: general-purpose solvers don't exploit that structure. They preprocess, precondition, and regularize for the worst case. With ternary features, the worst case rarely arrives.
 
-When you regress continuous targets onto ternary features, you're essentially asking: "Given a pattern of activations and inhibitions, what's the expected output?" This comes up constantly in:
+## The Insight
 
-- **Quantized neural network analysis**: predict layer output statistics from ternary weight patterns
-- **Ternary feature importance**: which {−1, 0, +1} features drive the target?
-- **Calibration**: map ternary classifier scores to calibrated probabilities
+When features are {−1, 0, +1}, the design matrix `XᵀX` is tightly bounded. Each diagonal entry is at most N (if a feature is always ±1), and off-diagonal entries are correlation-weighted sums bounded by the same N. This means the condition number of `XᵀX` is predictable and usually moderate — OLS rarely needs regularization.
 
-The key insight: with ternary features, `XᵀX` has a predictable structure. Each diagonal entry counts feature variance (bounded by 1), and off-diagonal entries are correlation-weighted. This means OLS rarely needs regularization — the features are already well-conditioned by construction.
+The gradient `∂L/∂wⱼ = 2(ŷ − y) · xⱼ/n` is also constrained: `xⱼ` is one of three values, so every gradient update is a discrete multiple of the residual. The optimizer can't oscillate in tiny increments — it moves in steps proportional to the error, scaled by {-1, 0, +1}.
 
-## Quick Start
+This is why ternary regression works with a straightforward normal-equation solver and Gaussian elimination: the problem is already well-conditioned.
+
+## How It Works
+
+**Three solvers, one decision point:**
+
+```
+fit(x, y) → l1_penalty > 0?
+                │
+         yes ←──┴──→ no
+          │           │
+    fit_iterative   fit_normal
+    (proximal       (XᵀX + λI)β = Xᵀy
+     gradient        via Gaussian elimination
+     + soft
+     threshold)
+```
+
+### OLS and Ridge: The Normal Equation
+
+1. Compute `XᵀX` — a d×d matrix where each entry is a sum of products of ternary values (integer arithmetic, no floating-point accumulation error in the products themselves).
+2. Add `λI` to the diagonal (λ=0 for OLS, λ>0 for Ridge).
+3. Compute `Xᵀy`.
+4. Solve via Gaussian elimination with partial pivoting.
+5. Derive the intercept separately: `b = ȳ − x̄·β`. This keeps `XᵀX` at d×d instead of (d+1)×(d+1).
+
+### Lasso: Proximal Gradient Descent
+
+Starts from the OLS/Ridge solution, then iterates:
+
+```
+βⱼ ← soft_threshold(βⱼ − lr · ∂L/∂βⱼ, lr · λ)
+```
+
+The `soft_threshold` operator is the proximal operator for the L1 norm: `sign(z) · max(|z| − λ, 0)`. It drives small coefficients to exactly zero, producing sparse solutions — a built-in feature selector that tells you *which* ternary features matter.
+
+## Code Example
 
 ```rust
-use ternary_regression::{ols_regression, TernaryLinearRegression};
+use ternary_regression::{ols_regression, ridge_regression, lasso_regression,
+                         TernaryLinearRegression, RegressionConfig, analyze_residuals};
 
-// Ternary features, continuous targets
-let x = vec![
-    vec![ 1,  1],   // both features positive
-    vec![ 1, -1],   // mixed
-    vec![-1,  1],   // mixed
-    vec![-1, -1],   // both negative
-    vec![ 0,  0],   // neutral
+// Features: ternary patterns. Targets: continuous.
+let x: Vec<Vec<i8>> = vec![
+    vec![ 1,  1],
+    vec![ 1, -1],
+    vec![-1,  1],
+    vec![-1, -1],
+    vec![ 0,  0],
 ];
-let y = vec![5.0, 1.0, -1.0, -5.0, 0.0]; // y = 2*x[0] + 3*x[1]
+let y: Vec<f64> = vec![5.0, 1.0, -1.0, -5.0, 0.0]; // y ≈ 2·x₀ + 3·x₁
 
-let result = ols_regression(&x, &y);
+// OLS — exact solution, no hyperparameters
+let ols = ols_regression(&x, &y);
+println!("coefs: {:?}", ols.coefficients);  // [~2.0, ~3.0]
+println!("R²:    {:.4}", ols.r_squared);     // ~1.0
 
-println!("Coefficients: {:?}", result.coefficients);  // [~2.0, ~3.0]
-println!("Intercept:    {:.4}", result.intercept);     // ~0.0
-println!("R²:           {:.4}", result.r_squared);     // ~1.0
+// Ridge — shrinks coefficients toward zero
+let ridge = ridge_regression(&x, &y, 10.0);
+let ols_norm: f64 = ols.coefficients.iter().map(|c| c*c).sum::<f64>().sqrt();
+let ridge_norm: f64 = ridge.coefficients.iter().map(|c| c*c).sum::<f64>().sqrt();
+assert!(ridge_norm <= ols_norm); // always holds
+
+// Lasso — drives irrelevant features to exactly zero
+let x_sparse: Vec<Vec<i8>> = vec![
+    vec![1, 1], vec![1, -1], vec![-1, 1], vec![-1, -1], vec![1, 0], vec![-1, 0],
+];
+let y_sparse: Vec<f64> = x_sparse.iter().map(|xi| 3.0 * xi[0] as f64).collect();
+let lasso = lasso_regression(&x_sparse, &y_sparse, 0.5);
+// lasso.coefficients[1] ≈ 0.0 (feature 1 is irrelevant)
 
 // Predict on new data
-let predictions = TernaryLinearRegression::predict(&result, &vec![
-    vec![1, 0], vec![-1, 0],
-]);
-```
-
-## The Three Solvers
-
-### OLS — When You Don't Need Regularization
-
-Solves `(XᵀX)β = Xᵀy` via Gaussian elimination with partial pivoting. Exact solution, no hyperparameters.
-
-```rust
-use ternary_regression::ols_regression;
-
-let result = ols_regression(&x, &y);
-```
-
-Use this when you have more samples than features and no multicollinearity (common with ternary features).
-
-### Ridge (L2) — Shrink Coefficients
-
-Adds `λI` to `XᵀX` to handle multicollinearity and prevent overfitting:
-
-```rust
-use ternary_regression::ridge_regression;
-
-let result = ridge_regression(&x, &y, 1.0); // alpha = 1.0
-// Coefficients are smaller in magnitude than OLS
-```
-
-Use this when features are correlated or you have few samples.
-
-### Lasso (L1) — Feature Selection
-
-Uses proximal gradient descent with soft-thresholding. Produces sparse coefficients — exactly zero for irrelevant features:
-
-```rust
-use ternary_regression::lasso_regression;
-
-let result = lasso_regression(&x, &y, 0.5);
-// Some coefficients will be exactly 0.0
-```
-
-Use this when you want to know *which* ternary features matter.
-
-## Architecture
-
-```
-┌────────────────────────────────────────────────────┐
-│         TernaryLinearRegression                    │
-│                                                    │
-│  fit(x, y) ──→ l1 > 0? ──yes──→ fit_iterative()  │
-│                    │               (proximal grad)  │
-│                    no                               │
-│                    │                               │
-│                    └──→ fit_normal()               │
-│                         (XᵀX + λI)β = Xᵀy        │
-│                                                    │
-│  predict(result, x_new) → ŷ                       │
-├────────────────────────────────────────────────────┤
-│  Utility Functions                                 │
-│  mse(y_true, y_pred)                               │
-│  mae(y_true, y_pred)                               │
-│  analyze_residuals(residuals) → ResidualAnalysis   │
-├────────────────────────────────────────────────────┤
-│  Convenience Functions                             │
-│  ols_regression(x, y)                              │
-│  ridge_regression(x, y, alpha)                     │
-│  lasso_regression(x, y, alpha)                     │
-└────────────────────────────────────────────────────┘
-```
-
-### The Normal Equation Solver
-
-For OLS and Ridge, the solve path is:
-
-1. Compute `XᵀX` (d × d matrix) — for N samples with d ternary features
-2. Add `λI` to diagonal (zero for OLS)
-3. Compute `Xᵀy` (d × 1 vector)
-4. Solve via Gaussian elimination with partial pivoting
-5. Derive intercept: `b = ȳ − x̄·β`
-
-The intercept isn't part of the normal equation — it's computed separately as the mean adjustment. This means `XᵀX` is always d × d, not (d+1) × (d+1), which matters for numerical stability.
-
-### The Lasso Solver
-
-Proximal gradient descent with soft-thresholding:
-
-```
-βⱼ ← sign(βⱼ − lr·∂L/∂βⱼ) · max(|βⱼ − lr·∂L/∂βⱼ| − lr·λ, 0)
-```
-
-The soft-thresholding operator is the proximal operator for the L1 norm. It drives small coefficients to exactly zero, producing sparse solutions.
-
-## API Reference
-
-### `RegressionResult`
-
-| Field | Description |
-|-------|-------------|
-| `coefficients` | Fitted feature weights (Vec<f64>) |
-| `intercept` | Bias term |
-| `r_squared` | R² on training data |
-| `residuals` | yᵢ − ŷᵢ for each training point |
-| `iterations` | Iterations used (0 for direct solve) |
-
-### `RegressionConfig`
-
-| Field | Default | Purpose |
-|-------|---------|---------|
-| `l2_penalty` | 0.0 | Ridge strength |
-| `l1_penalty` | 0.0 | Lasso strength |
-| `learning_rate` | 0.01 | Step size (lasso only) |
-| `max_iter` | 10000 | Max iterations (lasso only) |
-| `tol` | 1e-10 | Convergence tolerance |
-
-### `ResidualAnalysis`
-
-Produced by `analyze_residuals(&result.residuals)`:
-
-| Field | Description |
-|-------|-------------|
-| `mean` | Should be near 0 for a good fit |
-| `std_dev` | Spread of errors |
-| `min` / `max` | Error range |
-| `mse` | Mean squared error |
-| `mae` | Mean absolute error |
-
-## Real-World Example: Predicting Quantized Layer Performance
-
-```rust
-use ternary_regression::{ols_regression, analyze_residuals, TernaryLinearRegression};
-
-// Features: ternary weight statistics for each layer in a quantized network
-// x[i] = [ratio_neg, ratio_zero, ratio_pos, sparsity_pattern]
-let layer_features: Vec<Vec<i8>> = vec![
-    vec![-1,  0,  1,  1],   // layer 0
-    vec![ 0,  0,  0,  1],   // layer 1 (sparse)
-    vec![-1, -1,  1, -1],   // layer 2
-    vec![ 1,  0,  1,  0],   // layer 3
-    vec![ 0,  1,  0, -1],   // layer 4
-];
-
-// Target: measured inference accuracy drop (percentage points)
-let accuracy_drop = vec![0.5, 0.2, 1.8, 0.3, 0.1];
-
-let result = ols_regression(&layer_features, &accuracy_drop);
-
-// Which features predict accuracy drop?
-for (i, coef) in result.coefficients.iter().enumerate() {
-    println!("Feature {}: {:.3} ({})", 
-        i, coef,
-        if coef.abs() > 0.5 { "important" } else { "noise" });
-}
+let preds = TernaryLinearRegression::predict(&ols, &vec![vec![1, 0], vec![-1, 0]]);
 
 // Residual analysis
-let analysis = analyze_residuals(&result.residuals);
-println!("Mean residual: {:.4} (should be ~0)", analysis.mean);
-println!("R²: {:.4}", result.r_squared);
-
-// Predict for a new layer
-let new_layer = vec![1i8, -1, 1, 1];
-let prediction = TernaryLinearRegression::predict(&result, &vec![new_layer]);
-println!("Predicted accuracy drop: {:.2}%", prediction[0]);
+let analysis = analyze_residuals(&ols.residuals);
+println!("residual std: {:.4}", analysis.std_dev);
+println!("MAE:          {:.4}", analysis.mae);
 ```
 
-## Ecosystem Connections
+## Module Map
 
-- **`ternary-logistic`** — Same features, categorical targets. Use regression for continuous targets, logistic for classification.
-- **`ternary-em`** — EM can discover subpopulations in your data before regression. Run EM to split, then regress within each cluster.
-- **`ternary-fence`** — Coordinate distributed regression training across workers.
+```
+ternary_regression
+├── TernaryLinearRegression
+│   ├── new()                         — default config (OLS)
+│   ├── with_config(config)           — custom config
+│   ├── fit(x, y) → RegressionResult  — dispatches to normal or iterative
+│   └── predict(result, x) → Vec<f64>
+├── RegressionConfig
+│   ├── l2_penalty: f64               — Ridge strength (0 = OLS)
+│   ├── l1_penalty: f64               — Lasso strength (0 = no L1)
+│   ├── learning_rate: f64            — step size for Lasso
+│   ├── max_iter: usize               — cap for iterative solver
+│   └── tol: f64                      — convergence threshold
+├── RegressionResult
+│   ├── coefficients: Vec<f64>
+│   ├── intercept: f64
+│   ├── r_squared: f64
+│   ├── residuals: Vec<f64>
+│   └── iterations: usize             — 0 for direct solve
+├── Convenience functions
+│   ├── ols_regression(x, y)
+│   ├── ridge_regression(x, y, alpha)
+│   └── lasso_regression(x, y, alpha)
+├── Metrics
+│   ├── mse(y_true, y_pred) → f64
+│   ├── mae(y_true, y_pred) → f64
+│   └── analyze_residuals(residuals) → ResidualAnalysis
+└── Internal
+    ├── solve_linear_system(A, b)     — Gaussian elimination + partial pivoting
+    ├── compute_r_squared(y, ŷ)       — 1 − SS_res/SS_tot
+    └── soft_threshold(z, λ)          — sign(z)·max(|z|−λ, 0)
+```
 
-## Performance Notes
+## Design Decisions
 
-- **OLS solve**: O(d³) for the Gaussian elimination, where d is the number of features. With ternary features, d is typically small (<100), so this is fast.
-- **Lasso**: O(N × d × max_iter). Convergence depends on the learning rate and penalty strength. Start with defaults and tune.
-- **Memory**: O(d²) for XᵀX. For d < 1000, fits in L1/L2 cache.
-- **Ternary advantage**: The design matrix entries are −1, 0, +1, so XᵀX computation uses integer multiply-accumulate. Potential for SIMD optimization.
+**Intercept computed separately, not absorbed into the normal equation.** Adding a constant feature column would make `XᵀX` a (d+1)×(d+1) system and worsen conditioning. Computing `b = ȳ − x̄·β` after solving keeps the system smaller and better-conditioned.
 
-## Open Questions
+**Gaussian elimination, not LU/Cholesky.** For the typical dimensionality of ternary feature spaces (d < 100), the O(d³) cost is negligible. Gaussian elimination with partial pivoting is simple, correct, and avoids the positive-definiteness requirement of Cholesky.
 
-- **Weighted least squares**: No support for sample weights. Would be useful for importance-weighted regression on imbalanced ternary datasets.
-- **Robust regression**: OLS is sensitive to outliers. An M-estimator or RANSAC variant would be more robust.
-- **Cross-validation**: No built-in k-fold CV. You'd need to implement it manually to compare OLS vs Ridge vs Lasso.
-- **Elastic net**: Combines L1 and L2. Currently you get one or the other, not both.
+**Lasso uses proximal gradient, not coordinate descent.** Coordinate descent cycles through features one at a time. Proximal gradient updates all features simultaneously with soft-thresholding. The trade-off: proximal gradient needs a learning rate, but it parallelizes trivially if you later want to SIMD the gradient computation.
+
+**i8 features, f64 arithmetic.** The input features are `i8` (compact, three-valued), but all matrix arithmetic is `f64`. The ternary structure helps the *conditioning* of the problem, but the solution itself is continuous — the coefficients are real numbers.
+
+## Status
+
+| Aspect | State |
+|--------|-------|
+| OLS | Stable, tested |
+| Ridge (L2) | Stable, tested |
+| Lasso (L1) | Works, fixed iteration count (no early stopping) |
+| Elastic Net (L1+L2) | Not supported |
+| Weighted least squares | Not supported |
+| Cross-validation | Not built-in |
+| SIMD / parallel | Not yet |
+| MSRV | Edition 2024 |
+
+**Known limitations:** The Lasso solver runs for a fixed `max_iter` iterations without checking the convergence tolerance. For high penalty values, the learning rate may need manual tuning. No elastic net (combined L1+L2) — you get one or the other.
+
+## Related Crates
+
+- **[ternary-logistic](https://github.com/SuperInstance/ternary-logistic)** — Same feature space, categorical targets
+- **[ternary-em](https://github.com/SuperInstance/ternary-em)** — Discover subpopulations before regression
+- **[ternary-fence](https://github.com/SuperInstance/ternary-fence)** — Distributed regression across workers
 
 ## License
 
