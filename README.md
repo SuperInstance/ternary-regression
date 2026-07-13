@@ -54,7 +54,7 @@ The `soft_threshold` operator is the proximal operator for the L1 norm: `sign(z)
 
 ```rust
 use ternary_regression::{ols_regression, ridge_regression, lasso_regression,
-                         TernaryLinearRegression, RegressionConfig, analyze_residuals};
+                         TernaryLinearRegression, analyze_residuals};
 
 // Features: ternary patterns. Targets: continuous.
 let x: Vec<Vec<i8>> = vec![
@@ -64,7 +64,7 @@ let x: Vec<Vec<i8>> = vec![
     vec![-1, -1],
     vec![ 0,  0],
 ];
-let y: Vec<f64> = vec![5.0, 1.0, -1.0, -5.0, 0.0]; // y ≈ 2·x₀ + 3·x₁
+let y: Vec<f64> = vec![5.0, -1.0, 1.0, -5.0, 0.0]; // y ≈ 2·x₀ + 3·x₁
 
 // OLS — exact solution, no hyperparameters
 let ols = ols_regression(&x, &y);
@@ -150,7 +150,7 @@ ternary_regression
 | Weighted least squares | Not supported |
 | Cross-validation | Not built-in |
 | SIMD / parallel | Not yet |
-| MSRV | Edition 2024 |
+| MSRV | Edition 2021 |
 
 **Known limitations:** The Lasso solver runs for a fixed `max_iter` iterations without checking the convergence tolerance. For high penalty values, the learning rate may need manual tuning. No elastic net (combined L1+L2) — you get one or the other.
 
