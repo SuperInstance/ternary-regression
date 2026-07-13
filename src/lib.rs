@@ -326,6 +326,7 @@ fn soft_threshold(z: f64, lambda: f64) -> f64 {
 
 /// Compute mean squared error.
 pub fn mse(y_true: &[f64], y_pred: &[f64]) -> f64 {
+    assert!(!y_true.is_empty(), "y_true must not be empty");
     let n = y_true.len() as f64;
     y_true
         .iter()
@@ -337,6 +338,7 @@ pub fn mse(y_true: &[f64], y_pred: &[f64]) -> f64 {
 
 /// Compute mean absolute error.
 pub fn mae(y_true: &[f64], y_pred: &[f64]) -> f64 {
+    assert!(!y_true.is_empty(), "y_true must not be empty");
     let n = y_true.len() as f64;
     y_true
         .iter()
