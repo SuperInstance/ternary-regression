@@ -76,6 +76,23 @@ impl TernaryLinearRegression {
     /// - `x`: feature matrix (n × d), each entry in {-1, 0, +1}
     /// - `y`: target values
     pub fn fit(&self, x: &[Vec<i8>], y: &[f64]) -> RegressionResult {
+        assert!(!x.is_empty(), "feature matrix x must not be empty");
+        assert!(
+            !x[0].is_empty(),
+            "feature dimension must be greater than zero"
+        );
+        assert_eq!(
+            x.len(),
+            y.len(),
+            "x and y must have the same number of rows"
+        );
+        // Reject ragged matrices (rows of differing length)
+        let d = x[0].len();
+        assert!(
+            x.iter().all(|row| row.len() == d),
+            "all feature rows must have the same length"
+        );
+
         if self.config.l1_penalty > 0.0 {
             self.fit_iterative(x, y)
         } else {
@@ -87,8 +104,8 @@ impl TernaryLinearRegression {
     fn fit_normal(&self, x: &[Vec<i8>], y: &[f64]) -> RegressionResult {
         let n = x.len();
         let d = x[0].len();
-        assert!(n > 0 && d > 0);
-        assert_eq!(x.len(), y.len());
+        // Input validation is performed in fit(); fit_normal is only called
+        // from fit() (directly or via fit_iterative), so n > 0 and d > 0 here.
 
         // XᵀX (d × d)
         let mut xtx = vec![vec![0.0; d]; d];
@@ -341,6 +358,7 @@ pub struct ResidualAnalysis {
 
 /// Perform residual analysis.
 pub fn analyze_residuals(residuals: &[f64]) -> ResidualAnalysis {
+    assert!(!residuals.is_empty(), "residuals must not be empty");
     let n = residuals.len() as f64;
     let mean = residuals.iter().sum::<f64>() / n;
     let variance = residuals.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n;
