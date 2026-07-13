@@ -52,6 +52,12 @@ pub struct TernaryLinearRegression {
     config: RegressionConfig,
 }
 
+impl Default for TernaryLinearRegression {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TernaryLinearRegression {
     /// Create with default config (OLS).
     pub fn new() -> Self {
@@ -86,24 +92,24 @@ impl TernaryLinearRegression {
 
         // XᵀX (d × d)
         let mut xtx = vec![vec![0.0; d]; d];
-        for i in 0..n {
-            for j in 0..d {
-                for k in 0..d {
-                    xtx[j][k] += x[i][j] as f64 * x[i][k] as f64;
+        for row in x.iter() {
+            for (j, &xj) in row.iter().enumerate() {
+                for (k, &xk) in row.iter().enumerate() {
+                    xtx[j][k] += xj as f64 * xk as f64;
                 }
             }
         }
 
         // Add L2 penalty to diagonal
-        for j in 0..d {
-            xtx[j][j] += self.config.l2_penalty;
+        for (j, row) in xtx.iter_mut().enumerate() {
+            row[j] += self.config.l2_penalty;
         }
 
         // Xᵀy (d × 1)
         let mut xty = vec![0.0; d];
-        for i in 0..n {
-            for j in 0..d {
-                xty[j] += x[i][j] as f64 * y[i];
+        for (row, &yi) in x.iter().zip(y.iter()) {
+            for (j, &xij) in row.iter().enumerate() {
+                xty[j] += xij as f64 * yi;
             }
         }
 
@@ -115,10 +121,18 @@ impl TernaryLinearRegression {
         let mean_x: Vec<f64> = (0..d)
             .map(|j| x.iter().map(|row| row[j] as f64).sum::<f64>() / n as f64)
             .collect();
-        let intercept = mean_y - mean_x.iter().zip(&coefficients).map(|(m, c)| m * c).sum::<f64>();
+        let intercept = mean_y
+            - mean_x
+                .iter()
+                .zip(&coefficients)
+                .map(|(m, c)| m * c)
+                .sum::<f64>();
 
         // Residuals and R²
-        let predicted: Vec<f64> = x.iter().map(|xi| Self::predict_with(&coefficients, intercept, xi)).collect();
+        let predicted: Vec<f64> = x
+            .iter()
+            .map(|xi| Self::predict_with(&coefficients, intercept, xi))
+            .collect();
         let residuals: Vec<f64> = y.iter().zip(&predicted).map(|(yi, pi)| yi - pi).collect();
         let r_squared = compute_r_squared(y, &predicted);
 
@@ -137,7 +151,7 @@ impl TernaryLinearRegression {
         let d = x[0].len();
 
         // Start with OLS solution
-        let mut result = self.fit_normal(x, y);
+        let result = self.fit_normal(x, y);
         let mut beta = result.coefficients.clone();
         let mut intercept = result.intercept;
         let lr = self.config.learning_rate;
@@ -166,7 +180,10 @@ impl TernaryLinearRegression {
             intercept -= lr * grad_b;
         }
 
-        let predicted: Vec<f64> = x.iter().map(|xi| Self::predict_with(&beta, intercept, xi)).collect();
+        let predicted: Vec<f64> = x
+            .iter()
+            .map(|xi| Self::predict_with(&beta, intercept, xi))
+            .collect();
         let residuals: Vec<f64> = y.iter().zip(&predicted).map(|(yi, pi)| yi - pi).collect();
         let r_squared = compute_r_squared(y, &predicted);
 
@@ -216,9 +233,10 @@ fn solve_linear_system(a: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
         // Find pivot
         let mut max_row = col;
         let mut max_val = aug[col][col].abs();
-        for row in (col + 1)..n {
-            if aug[row][col].abs() > max_val {
-                max_val = aug[row][col].abs();
+        for (row, aug_row) in aug.iter().enumerate().take(n).skip(col + 1) {
+            let val = aug_row[col].abs();
+            if val > max_val {
+                max_val = val;
                 max_row = row;
             }
         }
@@ -228,11 +246,13 @@ fn solve_linear_system(a: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
             continue; // Skip singular columns
         }
 
-        // Eliminate below
-        for row in (col + 1)..n {
-            let factor = aug[row][col] / aug[col][col];
-            for j in col..=n {
-                aug[row][j] -= factor * aug[col][j];
+        // Eliminate below (split borrow: read pivot row, mutate rows beneath)
+        let (top, bottom) = aug.split_at_mut(col + 1);
+        let pivot = &top[col];
+        for aug_row in bottom.iter_mut() {
+            let factor = aug_row[col] / pivot[col];
+            for (dst, &src) in aug_row[col..=n].iter_mut().zip(pivot[col..=n].iter()) {
+                *dst -= factor * src;
             }
         }
     }
@@ -384,11 +404,22 @@ mod tests {
             vec![1, 0],
             vec![1, 1],
         ];
-        let y: Vec<f64> = x.iter().map(|xi| 2.0 * xi[0] as f64 + 3.0 * xi[1] as f64 + 1.0).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .map(|xi| 2.0 * xi[0] as f64 + 3.0 * xi[1] as f64 + 1.0)
+            .collect();
 
         let result = ols_regression(&x, &y);
-        assert!((result.coefficients[0] - 2.0).abs() < 0.1, "coef[0] = {}", result.coefficients[0]);
-        assert!((result.coefficients[1] - 3.0).abs() < 0.1, "coef[1] = {}", result.coefficients[1]);
+        assert!(
+            (result.coefficients[0] - 2.0).abs() < 0.1,
+            "coef[0] = {}",
+            result.coefficients[0]
+        );
+        assert!(
+            (result.coefficients[1] - 3.0).abs() < 0.1,
+            "coef[1] = {}",
+            result.coefficients[1]
+        );
         assert!(
             (result.intercept - 1.0).abs() < 0.1,
             "intercept = {}",
@@ -398,9 +429,7 @@ mod tests {
 
     #[test]
     fn test_r_squared_perfect_fit() {
-        let x: Vec<Vec<i8>> = vec![
-            vec![1], vec![-1], vec![0], vec![1], vec![-1],
-        ];
+        let x: Vec<Vec<i8>> = vec![vec![1], vec![-1], vec![0], vec![1], vec![-1]];
         let y: Vec<f64> = x.iter().map(|xi| 5.0 * xi[0] as f64).collect();
 
         let result = ols_regression(&x, &y);
@@ -464,9 +493,7 @@ mod tests {
 
     #[test]
     fn test_prediction_correctness() {
-        let x: Vec<Vec<i8>> = vec![
-            vec![1], vec![-1], vec![0], vec![1], vec![-1],
-        ];
+        let x: Vec<Vec<i8>> = vec![vec![1], vec![-1], vec![0], vec![1], vec![-1]];
         let y: Vec<f64> = vec![2.0, -2.0, 0.0, 2.0, -2.0]; // y = 2*x[0]
 
         let result = ols_regression(&x, &y);
