@@ -52,6 +52,12 @@ pub struct TernaryLinearRegression {
     config: RegressionConfig,
 }
 
+impl Default for TernaryLinearRegression {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TernaryLinearRegression {
     /// Create with default config (OLS).
     pub fn new() -> Self {
@@ -70,6 +76,23 @@ impl TernaryLinearRegression {
     /// - `x`: feature matrix (n × d), each entry in {-1, 0, +1}
     /// - `y`: target values
     pub fn fit(&self, x: &[Vec<i8>], y: &[f64]) -> RegressionResult {
+        assert!(!x.is_empty(), "feature matrix x must not be empty");
+        assert!(
+            !x[0].is_empty(),
+            "feature dimension must be greater than zero"
+        );
+        assert_eq!(
+            x.len(),
+            y.len(),
+            "x and y must have the same number of rows"
+        );
+        // Reject ragged matrices (rows of differing length)
+        let d = x[0].len();
+        assert!(
+            x.iter().all(|row| row.len() == d),
+            "all feature rows must have the same length"
+        );
+
         if self.config.l1_penalty > 0.0 {
             self.fit_iterative(x, y)
         } else {
@@ -81,29 +104,29 @@ impl TernaryLinearRegression {
     fn fit_normal(&self, x: &[Vec<i8>], y: &[f64]) -> RegressionResult {
         let n = x.len();
         let d = x[0].len();
-        assert!(n > 0 && d > 0);
-        assert_eq!(x.len(), y.len());
+        // Input validation is performed in fit(); fit_normal is only called
+        // from fit() (directly or via fit_iterative), so n > 0 and d > 0 here.
 
         // XᵀX (d × d)
         let mut xtx = vec![vec![0.0; d]; d];
-        for i in 0..n {
-            for j in 0..d {
-                for k in 0..d {
-                    xtx[j][k] += x[i][j] as f64 * x[i][k] as f64;
+        for row in x.iter() {
+            for (j, &xj) in row.iter().enumerate() {
+                for (k, &xk) in row.iter().enumerate() {
+                    xtx[j][k] += xj as f64 * xk as f64;
                 }
             }
         }
 
         // Add L2 penalty to diagonal
-        for j in 0..d {
-            xtx[j][j] += self.config.l2_penalty;
+        for (j, row) in xtx.iter_mut().enumerate() {
+            row[j] += self.config.l2_penalty;
         }
 
         // Xᵀy (d × 1)
         let mut xty = vec![0.0; d];
-        for i in 0..n {
-            for j in 0..d {
-                xty[j] += x[i][j] as f64 * y[i];
+        for (row, &yi) in x.iter().zip(y.iter()) {
+            for (j, &xij) in row.iter().enumerate() {
+                xty[j] += xij as f64 * yi;
             }
         }
 
@@ -115,10 +138,18 @@ impl TernaryLinearRegression {
         let mean_x: Vec<f64> = (0..d)
             .map(|j| x.iter().map(|row| row[j] as f64).sum::<f64>() / n as f64)
             .collect();
-        let intercept = mean_y - mean_x.iter().zip(&coefficients).map(|(m, c)| m * c).sum::<f64>();
+        let intercept = mean_y
+            - mean_x
+                .iter()
+                .zip(&coefficients)
+                .map(|(m, c)| m * c)
+                .sum::<f64>();
 
         // Residuals and R²
-        let predicted: Vec<f64> = x.iter().map(|xi| Self::predict_with(&coefficients, intercept, xi)).collect();
+        let predicted: Vec<f64> = x
+            .iter()
+            .map(|xi| Self::predict_with(&coefficients, intercept, xi))
+            .collect();
         let residuals: Vec<f64> = y.iter().zip(&predicted).map(|(yi, pi)| yi - pi).collect();
         let r_squared = compute_r_squared(y, &predicted);
 
@@ -137,7 +168,7 @@ impl TernaryLinearRegression {
         let d = x[0].len();
 
         // Start with OLS solution
-        let mut result = self.fit_normal(x, y);
+        let result = self.fit_normal(x, y);
         let mut beta = result.coefficients.clone();
         let mut intercept = result.intercept;
         let lr = self.config.learning_rate;
@@ -166,7 +197,10 @@ impl TernaryLinearRegression {
             intercept -= lr * grad_b;
         }
 
-        let predicted: Vec<f64> = x.iter().map(|xi| Self::predict_with(&beta, intercept, xi)).collect();
+        let predicted: Vec<f64> = x
+            .iter()
+            .map(|xi| Self::predict_with(&beta, intercept, xi))
+            .collect();
         let residuals: Vec<f64> = y.iter().zip(&predicted).map(|(yi, pi)| yi - pi).collect();
         let r_squared = compute_r_squared(y, &predicted);
 
@@ -216,9 +250,10 @@ fn solve_linear_system(a: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
         // Find pivot
         let mut max_row = col;
         let mut max_val = aug[col][col].abs();
-        for row in (col + 1)..n {
-            if aug[row][col].abs() > max_val {
-                max_val = aug[row][col].abs();
+        for (row, aug_row) in aug.iter().enumerate().take(n).skip(col + 1) {
+            let val = aug_row[col].abs();
+            if val > max_val {
+                max_val = val;
                 max_row = row;
             }
         }
@@ -228,11 +263,13 @@ fn solve_linear_system(a: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
             continue; // Skip singular columns
         }
 
-        // Eliminate below
-        for row in (col + 1)..n {
-            let factor = aug[row][col] / aug[col][col];
-            for j in col..=n {
-                aug[row][j] -= factor * aug[col][j];
+        // Eliminate below (split borrow: read pivot row, mutate rows beneath)
+        let (top, bottom) = aug.split_at_mut(col + 1);
+        let pivot = &top[col];
+        for aug_row in bottom.iter_mut() {
+            let factor = aug_row[col] / pivot[col];
+            for (dst, &src) in aug_row[col..=n].iter_mut().zip(pivot[col..=n].iter()) {
+                *dst -= factor * src;
             }
         }
     }
@@ -263,7 +300,14 @@ fn compute_r_squared(y_true: &[f64], y_pred: &[f64]) -> f64 {
         .map(|(&yi, &pi)| (yi - pi).powi(2))
         .sum();
     if ss_tot < 1e-15 {
-        1.0
+        // All targets are identical: R² is mathematically undefined (0/0).
+        // If predictions are also perfect, return 1.0; otherwise 0.0 to
+        // indicate the model has no explanatory power beyond the constant.
+        if ss_res < 1e-15 {
+            1.0
+        } else {
+            0.0
+        }
     } else {
         1.0 - ss_res / ss_tot
     }
@@ -282,6 +326,7 @@ fn soft_threshold(z: f64, lambda: f64) -> f64 {
 
 /// Compute mean squared error.
 pub fn mse(y_true: &[f64], y_pred: &[f64]) -> f64 {
+    assert!(!y_true.is_empty(), "y_true must not be empty");
     let n = y_true.len() as f64;
     y_true
         .iter()
@@ -293,6 +338,7 @@ pub fn mse(y_true: &[f64], y_pred: &[f64]) -> f64 {
 
 /// Compute mean absolute error.
 pub fn mae(y_true: &[f64], y_pred: &[f64]) -> f64 {
+    assert!(!y_true.is_empty(), "y_true must not be empty");
     let n = y_true.len() as f64;
     y_true
         .iter()
@@ -321,6 +367,7 @@ pub struct ResidualAnalysis {
 
 /// Perform residual analysis.
 pub fn analyze_residuals(residuals: &[f64]) -> ResidualAnalysis {
+    assert!(!residuals.is_empty(), "residuals must not be empty");
     let n = residuals.len() as f64;
     let mean = residuals.iter().sum::<f64>() / n;
     let variance = residuals.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / n;
@@ -384,11 +431,22 @@ mod tests {
             vec![1, 0],
             vec![1, 1],
         ];
-        let y: Vec<f64> = x.iter().map(|xi| 2.0 * xi[0] as f64 + 3.0 * xi[1] as f64 + 1.0).collect();
+        let y: Vec<f64> = x
+            .iter()
+            .map(|xi| 2.0 * xi[0] as f64 + 3.0 * xi[1] as f64 + 1.0)
+            .collect();
 
         let result = ols_regression(&x, &y);
-        assert!((result.coefficients[0] - 2.0).abs() < 0.1, "coef[0] = {}", result.coefficients[0]);
-        assert!((result.coefficients[1] - 3.0).abs() < 0.1, "coef[1] = {}", result.coefficients[1]);
+        assert!(
+            (result.coefficients[0] - 2.0).abs() < 0.1,
+            "coef[0] = {}",
+            result.coefficients[0]
+        );
+        assert!(
+            (result.coefficients[1] - 3.0).abs() < 0.1,
+            "coef[1] = {}",
+            result.coefficients[1]
+        );
         assert!(
             (result.intercept - 1.0).abs() < 0.1,
             "intercept = {}",
@@ -398,9 +456,7 @@ mod tests {
 
     #[test]
     fn test_r_squared_perfect_fit() {
-        let x: Vec<Vec<i8>> = vec![
-            vec![1], vec![-1], vec![0], vec![1], vec![-1],
-        ];
+        let x: Vec<Vec<i8>> = vec![vec![1], vec![-1], vec![0], vec![1], vec![-1]];
         let y: Vec<f64> = x.iter().map(|xi| 5.0 * xi[0] as f64).collect();
 
         let result = ols_regression(&x, &y);
@@ -464,9 +520,7 @@ mod tests {
 
     #[test]
     fn test_prediction_correctness() {
-        let x: Vec<Vec<i8>> = vec![
-            vec![1], vec![-1], vec![0], vec![1], vec![-1],
-        ];
+        let x: Vec<Vec<i8>> = vec![vec![1], vec![-1], vec![0], vec![1], vec![-1]];
         let y: Vec<f64> = vec![2.0, -2.0, 0.0, 2.0, -2.0]; // y = 2*x[0]
 
         let result = ols_regression(&x, &y);
@@ -567,5 +621,180 @@ mod tests {
         let preds = TernaryLinearRegression::predict(&result, &new_x);
         assert!((preds[0] - 4.0).abs() < 0.1);
         assert!((preds[1] + 4.0).abs() < 0.1);
+    }
+
+    // ------------------------------------------------------------------
+    // Hand-verified closed-form OLS (independent derivation)
+    // ------------------------------------------------------------------
+
+    /// Independently verify OLS against a hand-computed closed-form solution.
+    ///
+    /// Data: x = [[1],[0],[-1],[1]], y = [4, 1, -2, 2]
+    ///
+    /// By hand:
+    ///   n=4, ȳ = 5/4, x̄ = 1/4
+    ///   XᵀX = 1²+0²+1²+1² = 3
+    ///   Xᵀy = 1·4 + 0·1 + (−1)·(−2) + 1·2 = 8
+    ///   β = 8/3
+    ///   intercept = ȳ − x̄·β = 5/4 − (1/4)(8/3) = 5/4 − 2/3 = 7/12
+    ///   residuals: 9/12, 5/12, 1/12, −15/12
+    ///   SS_res = (81+25+1+225)/144 = 332/144 = 83/36
+    ///   SS_tot = (121+1+169+9)/16 = 300/16 = 75/4
+    ///   R² = 1 − (83/36)/(75/4) = 1 − 83/675 = 592/675
+    #[test]
+    fn test_ols_hand_verified_closed_form() {
+        let x: Vec<Vec<i8>> = vec![vec![1], vec![0], vec![-1], vec![1]];
+        let y: Vec<f64> = vec![4.0, 1.0, -2.0, 2.0];
+
+        let result = ols_regression(&x, &y);
+
+        assert!(
+            (result.coefficients[0] - 8.0 / 3.0).abs() < 1e-10,
+            "β = {}, expected 8/3",
+            result.coefficients[0]
+        );
+        assert!(
+            (result.intercept - 7.0 / 12.0).abs() < 1e-10,
+            "intercept = {}, expected 7/12",
+            result.intercept
+        );
+        assert!(
+            (result.r_squared - 592.0 / 675.0).abs() < 1e-10,
+            "R² = {}, expected 592/675 ≈ 0.877",
+            result.r_squared
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Edge-case coverage
+    // ------------------------------------------------------------------
+
+    /// Collinear features produce a singular XᵀX. The solver should still
+    /// fit the data (predictions match y) even though individual coefficients
+    /// are not uniquely determined.
+    #[test]
+    fn test_collinear_features() {
+        // x0 == x1 for every row → XᵀX = [[4,4],[4,4]] (rank 1, singular)
+        let x: Vec<Vec<i8>> = vec![vec![1, 1], vec![-1, -1], vec![1, 1], vec![-1, -1]];
+        let y: Vec<f64> = vec![3.0, -3.0, 3.0, -3.0]; // y = 3·x0
+
+        let result = ols_regression(&x, &y);
+        let preds = TernaryLinearRegression::predict(&result, &x);
+
+        for (pred, &yi) in preds.iter().zip(y.iter()) {
+            assert!(
+                (pred - yi).abs() < 1e-10,
+                "Collinear fit prediction {} should match {}",
+                pred,
+                yi
+            );
+        }
+        assert!(
+            result.r_squared > 0.999,
+            "R² should be ~1 even with collinear features, got {}",
+            result.r_squared
+        );
+    }
+
+    /// Single data point: one sample to fit. The model predicts exactly.
+    #[test]
+    fn test_single_data_point() {
+        let x: Vec<Vec<i8>> = vec![vec![1]];
+        let y: Vec<f64> = vec![5.0];
+
+        let result = ols_regression(&x, &y);
+        assert!(
+            (result.coefficients[0] - 5.0).abs() < 1e-10,
+            "β = {}",
+            result.coefficients[0]
+        );
+        assert!(result.intercept.abs() < 1e-10);
+        assert!((result.r_squared - 1.0).abs() < 1e-10);
+    }
+
+    /// All-identical y-values: constant target. OLS sets coefficients to zero
+    /// and the intercept to the constant value.
+    #[test]
+    fn test_all_identical_y() {
+        let x: Vec<Vec<i8>> = vec![vec![1], vec![-1], vec![0]];
+        let y: Vec<f64> = vec![7.0, 7.0, 7.0];
+
+        let result = ols_regression(&x, &y);
+        assert!(
+            result.coefficients[0].abs() < 1e-10,
+            "coefficient should be 0 for constant target, got {}",
+            result.coefficients[0]
+        );
+        assert!((result.intercept - 7.0).abs() < 1e-10);
+        assert!((result.r_squared - 1.0).abs() < 1e-10);
+    }
+
+    /// When all targets are identical but predictions are wrong, R² should
+    /// be 0.0 (not the misleading 1.0 the old guard returned).
+    #[test]
+    fn test_r_squared_zero_variance_wrong_predictions() {
+        let y_true = vec![5.0, 5.0, 5.0];
+        let y_pred = vec![4.0, 6.0, 5.0];
+        let r2 = compute_r_squared(&y_true, &y_pred);
+        assert!(
+            r2.abs() < 1e-10,
+            "R² should be 0.0 for wrong predictions on constant target, got {}",
+            r2
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Lasso convergence
+    // ------------------------------------------------------------------
+
+    /// Verify that the lasso objective (MSE + λ·‖β‖₁) does not increase
+    /// from the OLS starting point. Proximal gradient descent is guaranteed
+    /// monotone for a sufficiently small learning rate (lr=0.01 ≪ 1/L here).
+    #[test]
+    fn test_lasso_objective_decreases() {
+        // y = 3·x0 + 1·x1 (perfect OLS fit → MSE = 0 at start, L1 penalty > 0)
+        let x: Vec<Vec<i8>> = vec![
+            vec![1, 1],
+            vec![1, -1],
+            vec![-1, 1],
+            vec![-1, -1],
+            vec![1, 0],
+            vec![-1, 0],
+        ];
+        let y: Vec<f64> = vec![4.0, 2.0, -2.0, -4.0, 3.0, -3.0];
+
+        let l1 = 0.5;
+        let ols = ols_regression(&x, &y);
+        let lasso = lasso_regression(&x, &y, l1);
+
+        // Lasso objective: (1/n)·Σ(ŷ−y)² + λ·Σ|βⱼ|  (intercept unpenalized)
+        let obj = |beta: &[f64], intercept: f64| -> f64 {
+            let n = x.len() as f64;
+            let sse: f64 = x
+                .iter()
+                .zip(y.iter())
+                .map(|(xi, &yi)| {
+                    let pred: f64 = beta
+                        .iter()
+                        .zip(xi.iter())
+                        .map(|(c, &xij)| c * xij as f64)
+                        .sum::<f64>()
+                        + intercept;
+                    (pred - yi).powi(2)
+                })
+                .sum();
+            let l1_norm: f64 = beta.iter().map(|c| c.abs()).sum();
+            sse / n + l1 * l1_norm
+        };
+
+        let obj_start = obj(&ols.coefficients, ols.intercept);
+        let obj_end = obj(&lasso.coefficients, lasso.intercept);
+
+        assert!(
+            obj_end <= obj_start + 1e-8,
+            "lasso objective should not increase: start={}, end={}",
+            obj_start,
+            obj_end
+        );
     }
 }
